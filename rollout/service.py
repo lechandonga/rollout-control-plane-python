@@ -339,3 +339,13 @@ class RolloutService:
                         self._apply_weight(plan, plan.stable.weight, plan.version)
                         plan.step_index = plan.stable.step_index
                         self.storage.save_plan(plan)
+
+    def wait_idle(self, timeout: float = 10.0) -> bool:
+        """等待所有后台任务自然结束（不取消）。超时返回 False。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._tasks_lock:
+                if not self._tasks:
+                    return True
+            time.sleep(0.01)
+        return False
