@@ -1,17 +1,127 @@
-"""渐进式发布控制面 HTTP 服务入口。"""
-from fastapi import FastAPI
+"""渐进式发布控制面 HTTP 服务入口。
+
+错误映射：每种 RolloutError.reason 映射到可区分的 HTTP 状态码与响应体。
+"""
+import logging
+import os
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from rollout.config import ControlPlaneConfig
+from rollout.errors import RolloutError
+from rollout.models import GatePolicy, HealthMetrics
 from rollout.service import RolloutService
 from rollout.storage import Storage
 
-app = FastAPI(title="rollout-control-plane")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 
-_config = ControlPlaneConfig()
+_STATUS_BY_REASON = {
+    "plan_not_found": 404,
+    "illegal_transition": 409,
+    "gate_blocked": 409,
+    "validation_error": 422,
+    "concurrency_limit": 429,
+    "storage_corrupt": 500,
+    "internal_error": 500,
+}
+
+_config = ControlPlaneConfig(
+    storage_path=os.environ.get("ROLLOUT_STORAGE", "rollout_state.json")
+)
 _storage = Storage(_config.storage_path)
 _service = RolloutService(_storage, _config)
+_service.recover()  # 启动即恢复中断状态
+
+app = FastAPI(title="rollout-control-plane")
+
+
+@app.exception_handler(RolloutError)
+async def rollout_error_handler(_: Request, exc: RolloutError):
+    return JSONResponse(
+        status_code=_STATUS_BY_REASON.get(exc.reason, 500),
+        content={"error": exc.reason, "detail": str(exc)},
+    )
+
+
+class CreatePlanRequest(BaseModel):
+    version: str
+    group: str
+    steps: list[int] = Field(..., min_length=1)
+    gate: GatePolicy | None = None
+
+
+class HealthReport(BaseModel):
+    error_rate: float = 0.0
+    unhealthy_ratio: float = 0.0
+
+
+class RollbackRequest(BaseModel):
+    reason: str = "manual"
 
 
 @app.get("/")
 def read_root():
     return {"service": "rollout-control-plane", "status": "ok"}
+
+
+@app.post("/plans", status_code=201)
+def create_plan(req: CreatePlanRequest):
+    plan = _service.create_plan(req.version, req.group, req.steps, req.gate)
+    return _service.observe(plan.plan_id)
+
+
+@app.post("/plans/{plan_id}/start")
+def start_plan(plan_id: str):
+    _service.start(plan_id)
+    return _service.observe(plan_id)
+
+
+@app.post("/plans/{plan_id}/advance")
+def advance_plan(plan_id: str):
+    _service.advance(plan_id)
+    return _service.observe(plan_id)
+
+
+@app.post("/plans/{plan_id}/run")
+def run_plan(plan_id: str):
+    _service.run_async(plan_id)
+    return _service.observe(plan_id)
+
+
+@app.post("/plans/{plan_id}/rollback")
+def rollback_plan(plan_id: str, req: RollbackRequest | None = None):
+    _service.rollback(plan_id, reason=(req.reason if req else "manual"))
+    return _service.observe(plan_id)
+
+
+@app.post("/plans/{plan_id}/abort")
+def abort_plan(plan_id: str):
+    _service.abort(plan_id)
+    return _service.observe(plan_id)
+
+
+@app.get("/plans/{plan_id}")
+def get_plan(plan_id: str):
+    return _service.observe(plan_id)
+
+
+@app.get("/plans")
+def list_plans():
+    return [_service.observe(p.plan_id) for p in _storage.list_plans()]
+
+
+@app.post("/groups/{group}/health")
+def report_health(group: str, req: HealthReport):
+    _service.report_health(group, HealthMetrics(
+        error_rate=req.error_rate, unhealthy_ratio=req.unhealthy_ratio))
+    return {"group": group, "recorded": True}
+
+
+@app.on_event("shutdown")
+def _shutdown():
+    _service.shutdown()
