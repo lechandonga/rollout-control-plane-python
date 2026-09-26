@@ -270,15 +270,13 @@ class RolloutService:
     # ------------------------------------------------------------------
     # 后台自动放量（受并发上限与超时约束）
     # ------------------------------------------------------------------
-    def run_async(self, plan_id: str, step_interval: float = 0.05) -> None:
-        """后台自动放量：门禁通过则逐步推进；阻塞超过超时则自动回滚。"""
-        plan = self._must_get(plan_id)
-        self._assert_not_batch_member(plan, "run")
+    def _submit_task(self, key: str, target, step_interval: float) -> None:
+        """占用一个并发槽位并提交后台循环；槽位在循环结束时必定释放。"""
         acquired = self._task_sem.acquire(blocking=False)
         if not acquired:
             if self.config.overflow_policy == "queue":
-                log.info("plan %s queued (task limit %d reached)",
-                         plan_id, self.config.max_concurrent_tasks)
+                log.info("task %s queued (task limit %d reached)",
+                         key, self.config.max_concurrent_tasks)
                 self._task_sem.acquire()
             else:
                 raise ConcurrencyLimitError(
@@ -286,14 +284,20 @@ class RolloutService:
                 )
         cancel = threading.Event()
         with self._tasks_lock:
-            self._tasks[plan_id] = cancel
+            self._tasks[key] = cancel
         try:
-            self._executor.submit(self._run_loop, plan_id, step_interval, cancel)
+            self._executor.submit(target, key, step_interval, cancel)
         except Exception:
             self._task_sem.release()
             with self._tasks_lock:
-                self._tasks.pop(plan_id, None)
+                self._tasks.pop(key, None)
             raise
+
+    def run_async(self, plan_id: str, step_interval: float = 0.05) -> None:
+        """后台自动放量：门禁通过则逐步推进；阻塞超过超时则自动回滚。"""
+        plan = self._must_get(plan_id)
+        self._assert_not_batch_member(plan, "run")
+        self._submit_task(plan_id, self._run_loop, step_interval)
 
     def _run_loop(self, plan_id: str, step_interval: float, cancel: threading.Event) -> None:
         try:
@@ -590,7 +594,40 @@ class RolloutService:
         return self.rollback_batch(batch_id, reason="aborted")
 
     def run_batch_async(self, batch_id: str, step_interval: float = 0.05) -> None:
-        raise NotImplementedError
+        """批次后台自动放量：与单计划共用并发上限与超时策略。"""
+        self._must_get_batch(batch_id)
+        self._submit_task(batch_id, self._run_batch_loop, step_interval)
+
+    def _run_batch_loop(self, batch_id: str, step_interval: float,
+                        cancel: threading.Event) -> None:
+        try:
+            while not cancel.is_set():
+                batch = self.storage.get_batch(batch_id)
+                if batch is None or batch.status != PlanStatus.RUNNING:
+                    return
+                try:
+                    self.advance_batch(batch_id)
+                except GateBlockedError:
+                    waited = 0.0
+                    while waited < self.config.step_timeout_seconds:
+                        time.sleep(step_interval)
+                        waited += step_interval
+                        try:
+                            self.advance_batch(batch_id)
+                            break
+                        except GateBlockedError:
+                            continue
+                    else:
+                        log.warning(
+                            "batch %s gate blocked beyond timeout, auto-rollback",
+                            batch_id)
+                        self.rollback_batch(batch_id, reason="gate_timeout")
+                        return
+                time.sleep(step_interval)
+        finally:
+            self._task_sem.release()
+            with self._tasks_lock:
+                self._tasks.pop(batch_id, None)
 
     def observe_batch(self, batch_id: str) -> dict:
         """批次观测：每个成员的步进/权重/判定依据 + 整批统一结论。
