@@ -18,6 +18,7 @@ from .config import ControlPlaneConfig
 from .errors import (
     ConcurrencyLimitError,
     GateBlockedError,
+    GroupConflictError,
     IllegalTransitionError,
     PlanNotFoundError,
     ValidationError,
@@ -29,6 +30,7 @@ from .models import (
     HealthMetrics,
     InstanceGroupState,
     PlanStatus,
+    ReleaseBatch,
     RolloutPlan,
     StablePoint,
 )
@@ -46,12 +48,13 @@ class RolloutService:
         self.storage = storage
         self.config = config or ControlPlaneConfig()
         self._plan_locks = [threading.Lock() for _ in range(self._LOCK_STRIPES)]
+        self._batch_locks = [threading.Lock() for _ in range(self._LOCK_STRIPES)]
         self._task_sem = threading.BoundedSemaphore(self.config.max_concurrent_tasks)
         self._executor = ThreadPoolExecutor(
             max_workers=self.config.max_concurrent_tasks,
             thread_name_prefix="rollout",
         )
-        self._tasks: dict[str, threading.Event] = {}  # plan_id -> cancel event
+        self._tasks: dict[str, threading.Event] = {}  # plan_id/batch_id -> cancel event
         self._tasks_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -60,11 +63,29 @@ class RolloutService:
     def _lock_for(self, plan_id: str) -> threading.Lock:
         return self._plan_locks[hash(plan_id) % self._LOCK_STRIPES]
 
+    def _batch_lock_for(self, batch_id: str) -> threading.Lock:
+        return self._batch_locks[hash(batch_id) % self._LOCK_STRIPES]
+
     def _must_get(self, plan_id: str) -> RolloutPlan:
         plan = self.storage.get_plan(plan_id)
         if plan is None:
             raise PlanNotFoundError(f"plan {plan_id} not found")
         return plan
+
+    def _must_get_batch(self, batch_id: str) -> ReleaseBatch:
+        batch = self.storage.get_batch(batch_id)
+        if batch is None:
+            raise PlanNotFoundError(f"batch {batch_id} not found")
+        return batch
+
+    def _assert_groups_free(self, groups: list[str]) -> None:
+        """同一实例组上不允许两条相互冲突的进行中发布（单组计划或批次）。"""
+        wanted = set(groups)
+        for p in self.storage.list_plans():
+            if p.group in wanted and not p.status.terminal:
+                owner = (f"batch {p.batch_id}" if p.batch_id
+                         else f"plan {p.plan_id}")
+                raise GroupConflictError(p.group, owner)
 
     def _transition(self, plan: RolloutPlan, action: str) -> None:
         """状态机迁移校验：非法迁移抛出带区分原因的异常。"""
@@ -110,10 +131,7 @@ class RolloutService:
     # ------------------------------------------------------------------
     # 计划生命周期
     # ------------------------------------------------------------------
-    def create_plan(self, version: str, group: str, steps: list[int],
-                    gate: GatePolicy | None = None) -> RolloutPlan:
-        if not version or not group:
-            raise ValidationError("version and group must be non-empty")
+    def _validate_steps(self, steps: list[int]) -> None:
         if not steps:
             raise ValidationError("steps must be non-empty")
         prev = 0
@@ -130,9 +148,19 @@ class RolloutService:
             prev = w
         if steps[-1] != 100:
             raise ValidationError("last step must be 100 (full rollout)")
-        gate = gate or GatePolicy()
+
+    def _validate_gate(self, gate: GatePolicy) -> None:
         if not (0 <= gate.max_error_rate <= 1 and 0 <= gate.max_unhealthy_ratio <= 1):
             raise ValidationError("gate thresholds must be within [0,1]")
+
+    def create_plan(self, version: str, group: str, steps: list[int],
+                    gate: GatePolicy | None = None) -> RolloutPlan:
+        if not version or not group:
+            raise ValidationError("version and group must be non-empty")
+        self._validate_steps(steps)
+        gate = gate or GatePolicy()
+        self._validate_gate(gate)
+        self._assert_groups_free([group])
         plan = RolloutPlan.new(version, group, steps, gate)
         self.storage.save_plan(plan)
         log.info("plan %s created: version=%s group=%s steps=%s",
@@ -351,17 +379,73 @@ class RolloutService:
         return False
 
     # ------------------------------------------------------------------
-    # 多组协同发布批次（骨架，逐步实现）
+    # 多组协同发布批次
     # ------------------------------------------------------------------
-    def create_batch(self, members: list[dict]) -> "ReleaseBatch":
+    def _batch_transition(self, batch: ReleaseBatch, action: str) -> None:
+        """批次状态机迁移校验（复用与计划相同的迁移表）。"""
+        key = (batch.status, action)
+        if key not in TRANSITIONS:
+            detail = ""
+            if batch.status.terminal:
+                detail = "batch is in a terminal state"
+            raise IllegalTransitionError(batch.batch_id, batch.status.value,
+                                         action, detail)
+        old = batch.status
+        batch.status = TRANSITIONS[key]
+        batch.updated_at = time.time()
+        log.info("batch %s: %s --%s--> %s",
+                 batch.batch_id, old.value, action, batch.status.value)
+
+    def _batch_members(self, batch: ReleaseBatch) -> list[RolloutPlan]:
+        plans = []
+        for pid in batch.plan_ids:
+            plan = self.storage.get_plan(pid)
+            if plan is None:
+                raise PlanNotFoundError(
+                    f"batch {batch.batch_id}: member plan {pid} missing"
+                )
+            plans.append(plan)
+        return plans
+
+    def create_batch(self, members: list[dict]) -> ReleaseBatch:
         """创建覆盖多个实例组的发布批次。
 
         members: [{"group": ..., "version": ..., "steps": [...], "gate": ...}, ...]
+        每个组有独立的版本与放量节奏；批次与成员计划在同一次原子落盘写入。
         """
-        raise NotImplementedError
+        if not members:
+            raise ValidationError("batch must contain at least one member group")
+        groups = [m.get("group", "") for m in members]
+        if any(not g for g in groups):
+            raise ValidationError("every member must have a non-empty group")
+        if len(set(groups)) != len(groups):
+            raise ValidationError("duplicate group in batch members")
+        for m in members:
+            if not m.get("version"):
+                raise ValidationError("every member must have a non-empty version")
+            self._validate_steps(list(m.get("steps") or []))
+            self._validate_gate(m.get("gate") or GatePolicy())
+        # 与任何进行中发布（单组计划或其他批次）冲突 -> 可区分原因
+        self._assert_groups_free(groups)
+        batch = ReleaseBatch.new(plan_ids=[])  # 先拿 batch_id
+        plans = [
+            RolloutPlan.new(m["version"], m["group"], list(m["steps"]),
+                            m.get("gate") or GatePolicy(), batch_id=batch.batch_id)
+            for m in members
+        ]
+        batch.plan_ids = [p.plan_id for p in plans]
+        self.storage.save_batch(batch, plans)
+        log.info("batch %s created: groups=%s", batch.batch_id, groups)
+        return batch
 
-    def start_batch(self, batch_id: str) -> "ReleaseBatch":
-        raise NotImplementedError
+    def start_batch(self, batch_id: str) -> ReleaseBatch:
+        with self._batch_lock_for(batch_id):
+            batch = self._must_get_batch(batch_id)
+            self._batch_transition(batch, "start")
+            for plan in self._batch_members(batch):
+                self._transition(plan, "start")
+            self.storage.save_batch(batch, self._batch_members(batch))
+            return batch
 
     def advance_batch(self, batch_id: str) -> "ReleaseBatch":
         """整批推进一步：所有成员门禁通过才一起前进，否则无任何变更。"""
