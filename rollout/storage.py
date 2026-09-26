@@ -43,10 +43,11 @@ class Storage:
         self._health: dict[str, HealthMetrics] = {}
 
     # ---- 计划 ----
-    def save_plan(self, plan: RolloutPlan) -> None:
+    def save_plan(self, plan: RolloutPlan, flush: bool = True) -> None:
         with self._lock:
             self._plans[plan.plan_id] = plan
-            self.flush()
+            if flush:
+                self.flush()
 
     def get_plan(self, plan_id: str) -> RolloutPlan | None:
         with self._lock:
@@ -75,10 +76,11 @@ class Storage:
             return list(self._batches.values())
 
     # ---- 实例组 ----
-    def save_group(self, group: InstanceGroupState) -> None:
+    def save_group(self, group: InstanceGroupState, flush: bool = True) -> None:
         with self._lock:
             self._groups[group.group] = group
-            self.flush()
+            if flush:
+                self.flush()
 
     def get_group(self, name: str) -> InstanceGroupState | None:
         with self._lock:

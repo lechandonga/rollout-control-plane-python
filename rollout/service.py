@@ -119,14 +119,15 @@ class RolloutService:
             f"unhealthy_ratio {m.unhealthy_ratio:.3f} <= {plan.gate.max_unhealthy_ratio:.3f}"
         )
 
-    def _apply_weight(self, plan: RolloutPlan, weight: int, version: str) -> None:
+    def _apply_weight(self, plan: RolloutPlan, weight: int, version: str,
+                      flush: bool = True) -> None:
         """把对外可见的组状态切到指定权重/版本并落盘（与计划同事务）。"""
         group = self.storage.get_group(plan.group) or InstanceGroupState(
             group=plan.group, version=version, weight=0
         )
         group.version = version
         group.weight = weight
-        self.storage.save_group(group)
+        self.storage.save_group(group, flush=flush)
 
     # ------------------------------------------------------------------
     # 计划生命周期
@@ -447,9 +448,53 @@ class RolloutService:
             self.storage.save_batch(batch, self._batch_members(batch))
             return batch
 
-    def advance_batch(self, batch_id: str) -> "ReleaseBatch":
-        """整批推进一步：所有成员门禁通过才一起前进，否则无任何变更。"""
-        raise NotImplementedError
+    def advance_batch(self, batch_id: str) -> ReleaseBatch:
+        """整批推进一步。
+
+        先对全体未完成成员做门禁判定：任一成员未通过则整批不动（其余组
+        不会各自扩量到无法回收的位置）；全部通过才把所有成员一起推进
+        一步，并在同一次原子落盘中持久化。
+        """
+        with self._batch_lock_for(batch_id):
+            batch = self._must_get_batch(batch_id)
+            if batch.status != PlanStatus.RUNNING:
+                self._batch_transition(batch, "advance")  # 必然抛出，给出区分原因
+            members = self._batch_members(batch)
+            active = [p for p in members if p.status == PlanStatus.RUNNING]
+            # 阶段一：全部门禁判定，任何变更前完成
+            verdicts: dict[str, tuple[GateVerdict, str]] = {}
+            for plan in active:
+                verdict, basis = self._evaluate_gate(plan)
+                verdicts[plan.plan_id] = (verdict, basis)
+                log.info("batch %s member %s (%s) gate verdict=%s basis=%s",
+                         batch_id, plan.plan_id, plan.group, verdict.value, basis)
+            blocked = [(p, verdicts[p.plan_id]) for p in active
+                       if verdicts[p.plan_id][0] is not GateVerdict.PASS]
+            if blocked:
+                plan, (verdict, basis) = blocked[0]
+                raise GateBlockedError(
+                    f"batch {batch_id}: member group {plan.group} gate "
+                    f"{verdict.value}: {basis} (batch not advanced)"
+                )
+            # 阶段二：整批一起推进一步，单次原子落盘
+            for plan in active:
+                plan.step_index += 1
+                weight = plan.steps[plan.step_index]
+                self._apply_weight(plan, weight, plan.version, flush=False)
+                plan.stable = StablePoint(step_index=plan.step_index, weight=weight)
+                if weight >= 100:
+                    self._transition(plan, "succeed")
+                else:
+                    self._transition(plan, "advance")
+                plan.updated_at = time.time()
+                self.storage.save_plan(plan, flush=False)
+            if all(p.status == PlanStatus.SUCCEEDED for p in members):
+                self._batch_transition(batch, "succeed")
+                log.info("batch %s completed: all members at weight=100", batch_id)
+            else:
+                self._batch_transition(batch, "advance")
+            self.storage.save_batch(batch)  # 唯一一次落盘，覆盖上述全部变更
+            return batch
 
     def rollback_batch(self, batch_id: str, reason: str = "manual") -> "ReleaseBatch":
         """整批回滚：所有成员一起回到各自最近稳定点。幂等。"""
@@ -463,4 +508,45 @@ class RolloutService:
 
     def observe_batch(self, batch_id: str) -> dict:
         """批次观测：每个成员的步进/权重/判定依据 + 整批统一结论。"""
-        raise NotImplementedError
+        batch = self._must_get_batch(batch_id)
+        members = []
+        non_pass: list[str] = []
+        saw_blocked = saw_waiting = False
+        for plan in self._batch_members(batch):
+            verdict, basis = self._evaluate_gate(plan)
+            if verdict is GateVerdict.BLOCKED:
+                saw_blocked = True
+                non_pass.append(f"{plan.group}: BLOCKED ({basis})")
+            elif verdict is GateVerdict.WAITING:
+                saw_waiting = True
+                non_pass.append(f"{plan.group}: WAITING ({basis})")
+            group = self.storage.get_group(plan.group)
+            members.append({
+                "plan_id": plan.plan_id,
+                "group": plan.group,
+                "version": plan.version,
+                "status": plan.status.value,
+                "step_index": plan.step_index,
+                "current_weight": plan.current_weight,
+                "stable_weight": plan.stable.weight,
+                "gate_verdict": verdict.value,
+                "gate_basis": basis,
+                "group_state": None if group is None else {
+                    "version": group.version, "weight": group.weight,
+                },
+            })
+        if saw_blocked:
+            overall = GateVerdict.BLOCKED.value
+        elif saw_waiting:
+            overall = GateVerdict.WAITING.value
+        else:
+            overall = GateVerdict.PASS.value
+        return {
+            "batch_id": batch.batch_id,
+            "status": batch.status.value,
+            "failure_reason": batch.failure_reason,
+            "overall_verdict": overall,
+            "overall_basis": ("; ".join(non_pass) if non_pass
+                              else "all member gates pass"),
+            "members": members,
+        }
