@@ -130,6 +130,57 @@ class InstanceGroupState:
     instances_healthy: bool = True
 
 
+# ---- 多组协同发布（批次） ----
+
+@dataclass
+class GroupTarget:
+    """批次中单个实例组的发布目标与进度。"""
+
+    group: str
+    version: str
+    steps: list[int]
+    step_index: int = -1
+    stable: StablePoint = field(default_factory=lambda: StablePoint(step_index=-1, weight=0))
+    gate: GatePolicy = field(default_factory=GatePolicy)
+    last_verdict: str | None = None   # 最近一次门禁判定（PASS/BLOCKED/WAITING）
+    last_basis: str | None = None     # 判定依据（可解释）
+
+    @property
+    def current_weight(self) -> int:
+        if self.step_index < 0:
+            return 0
+        return self.steps[self.step_index]
+
+    @property
+    def done(self) -> bool:
+        return self.step_index >= 0 and self.steps[self.step_index] >= 100
+
+
+@dataclass
+class BatchPlan:
+    """多组协同发布计划（持久化实体）。
+
+    对外状态始终是一致快照：推进与回滚对所有目标组原子生效。
+    状态机复用 PlanStatus（PENDING/RUNNING/SUCCEEDED/ROLLING_BACK/
+    ROLLED_BACK/ABORTED），迁移规则与单组计划一致。
+    """
+
+    batch_id: str
+    targets: list[GroupTarget]
+    status: PlanStatus = PlanStatus.PENDING
+    failure_reason: str | None = None
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    format_version: int = 1  # 批次自身的格式版本（独立于单组计划）
+
+    @staticmethod
+    def new(targets: list[GroupTarget]) -> "BatchPlan":
+        return BatchPlan(batch_id=uuid.uuid4().hex[:12], targets=targets)
+
+    def groups(self) -> list[str]:
+        return [t.group for t in self.targets]
+
+
 # ---- 序列化 / 反序列化（含格式演进） ----
 
 SUPPORTED_FORMAT_VERSIONS = (1, 2)
@@ -173,4 +224,54 @@ def plan_from_dict(data: dict[str, Any]) -> RolloutPlan:
         created_at=float(data.get("created_at", 0.0)),
         updated_at=float(data.get("updated_at", 0.0)),
         format_version=2,
+    )
+
+
+# ---- 批次序列化 / 反序列化 ----
+
+SUPPORTED_BATCH_FORMAT_VERSIONS = (1,)
+
+
+def batch_to_dict(batch: BatchPlan) -> dict[str, Any]:
+    d = asdict(batch)
+    d["status"] = batch.status.value
+    return d
+
+
+def batch_from_dict(data: dict[str, Any]) -> BatchPlan:
+    """从持久化字典恢复批次。
+
+    格式演进规则与单组计划一致：缺失字段用确定缺省，未知版本明确拒绝。
+    """
+    fv = data.get("format_version", 1)
+    if fv not in SUPPORTED_BATCH_FORMAT_VERSIONS:
+        raise ValueError(f"unsupported batch format_version: {fv!r}")
+    targets = []
+    for t in data.get("targets", []):
+        gate_data = t.get("gate") or {}
+        stable_data = t.get("stable") or {}
+        targets.append(GroupTarget(
+            group=t["group"],
+            version=t["version"],
+            steps=[int(s) for s in t["steps"]],
+            step_index=int(t.get("step_index", -1)),
+            stable=StablePoint(
+                step_index=int(stable_data.get("step_index", -1)),
+                weight=int(stable_data.get("weight", 0)),
+            ),
+            gate=GatePolicy(
+                max_error_rate=float(gate_data.get("max_error_rate", 0.05)),
+                max_unhealthy_ratio=float(gate_data.get("max_unhealthy_ratio", 0.2)),
+            ),
+            last_verdict=t.get("last_verdict"),
+            last_basis=t.get("last_basis"),
+        ))
+    return BatchPlan(
+        batch_id=data["batch_id"],
+        targets=targets,
+        status=PlanStatus(data["status"]),
+        failure_reason=data.get("failure_reason"),
+        created_at=float(data.get("created_at", 0.0)),
+        updated_at=float(data.get("updated_at", 0.0)),
+        format_version=1,
     )

@@ -62,3 +62,49 @@ def test_rollback_via_api(client):
     assert body["group_state"]["weight"] == body["stable_weight"]
     assert body["failure_reason"] == "alarm"
     log.info("verdict: rollback -> %s", body)
+
+
+def test_batch_flow_via_api(client):
+    r = client.post("/batches", json={"targets": [
+        {"group": "g1", "version": "v2", "steps": [10, 100]},
+        {"group": "g2", "version": "v1.1", "steps": [50, 100]},
+    ]})
+    assert r.status_code == 201
+    batch_id = r.json()["batch_id"]
+    log.info("input: create batch -> %s", r.json()["conclusion"])
+
+    assert client.post(f"/batches/{batch_id}/start").status_code == 200
+    # 未上报健康 -> 409 gate_blocked，整批不推进
+    r = client.post(f"/batches/{batch_id}/advance")
+    assert r.status_code == 409 and r.json()["error"] == "gate_blocked"
+
+    client.post("/groups/g1/health", json={})
+    client.post("/groups/g2/health", json={})
+    r = client.post(f"/batches/{batch_id}/advance")
+    body = r.json()
+    by_group = {g["group"]: g for g in body["groups"]}
+    assert by_group["g1"]["current_weight"] == 10
+    assert by_group["g2"]["current_weight"] == 50
+    assert all(g["gate_verdict"] == "PASS" for g in body["groups"])
+    log.info("verdict: per-group progress -> %s", body["conclusion"])
+
+    # 整批回滚：所有组一起回稳定点
+    r = client.post(f"/batches/{batch_id}/rollback", json={"reason": "alarm"})
+    body = r.json()
+    assert body["status"] == "ROLLED_BACK"
+    assert all(g["group_state"]["weight"] == g["stable_weight"]
+               for g in body["groups"])
+    log.info("verdict: batch rollback -> %s", body["conclusion"])
+
+
+def test_batch_conflict_via_api(client):
+    r = client.post("/plans", json={"version": "v2", "group": "g1",
+                                    "steps": [10, 100]})
+    plan_id = r.json()["plan_id"]
+    client.post(f"/plans/{plan_id}/start")
+    r = client.post("/batches", json={"targets": [
+        {"group": "g1", "version": "v3", "steps": [10, 100]},
+    ]})
+    assert r.status_code == 409 and r.json()["error"] == "group_conflict"
+    log.info("verdict: conflicting batch -> %s", r.json())
+    assert client.get("/batches/nope").status_code == 404

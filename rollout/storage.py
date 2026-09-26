@@ -15,16 +15,20 @@ from dataclasses import asdict
 
 from .errors import StorageCorruptError
 from .models import (
+    BatchPlan,
     HealthMetrics,
     InstanceGroupState,
     RolloutPlan,
+    batch_from_dict,
+    batch_to_dict,
     plan_from_dict,
     plan_to_dict,
 )
 
 log = logging.getLogger("rollout.storage")
 
-_TOP_LEVEL_VERSION = 2  # 存储文件顶层格式版本
+_TOP_LEVEL_VERSION = 3  # 存储文件顶层格式版本（v3 起新增 batches，读取兼容 v1/v2）
+_SUPPORTED_TOP_LEVEL_VERSIONS = (1, 2, _TOP_LEVEL_VERSION)
 
 
 class Storage:
@@ -34,6 +38,7 @@ class Storage:
         self.path = path
         self._lock = threading.RLock()
         self._plans: dict[str, RolloutPlan] = {}
+        self._batches: dict[str, BatchPlan] = {}
         self._groups: dict[str, InstanceGroupState] = {}
         self._health: dict[str, HealthMetrics] = {}
 
@@ -50,6 +55,33 @@ class Storage:
     def list_plans(self) -> list[RolloutPlan]:
         with self._lock:
             return list(self._plans.values())
+
+    # ---- 批次（多组协同发布） ----
+    def save_batch(self, batch: BatchPlan) -> None:
+        with self._lock:
+            self._batches[batch.batch_id] = batch
+            self.flush()
+
+    def get_batch(self, batch_id: str) -> BatchPlan | None:
+        with self._lock:
+            return self._batches.get(batch_id)
+
+    def list_batches(self) -> list[BatchPlan]:
+        with self._lock:
+            return list(self._batches.values())
+
+    def save_batch_with_groups(self, batch: BatchPlan,
+                               groups: list[InstanceGroupState]) -> None:
+        """批次状态与多个组状态在同一把锁内更新并一次原子落盘。
+
+        对外（任何经 get_group/get_batch 的读取）只能看到更新前或更新后
+        的快照，不会看到「部分组已变更」的中间状态。
+        """
+        with self._lock:
+            self._batches[batch.batch_id] = batch
+            for g in groups:
+                self._groups[g.group] = g
+            self.flush()
 
     # ---- 实例组 ----
     def save_group(self, group: InstanceGroupState) -> None:
@@ -86,7 +118,7 @@ class Storage:
             if not isinstance(raw, dict):
                 raise StorageCorruptError("storage root must be an object")
             version = raw.get("format_version", 1)
-            if version not in (1, _TOP_LEVEL_VERSION):
+            if version not in _SUPPORTED_TOP_LEVEL_VERSIONS:
                 raise StorageCorruptError(
                     f"unsupported storage format_version: {version!r}"
                 )
@@ -94,6 +126,11 @@ class Storage:
                 self._plans = {
                     p["plan_id"]: plan_from_dict(p)
                     for p in raw.get("plans", [])
+                }
+                # v1/v2 没有 batches 字段：确定缺省为空集合
+                self._batches = {
+                    b["batch_id"]: batch_from_dict(b)
+                    for b in raw.get("batches", [])
                 }
                 self._groups = {
                     g["group"]: InstanceGroupState(
@@ -116,7 +153,8 @@ class Storage:
             except (KeyError, TypeError, ValueError) as e:
                 raise StorageCorruptError(f"incompatible storage data: {e}") from e
             log.info(
-                "loaded storage: %d plans, %d groups", len(self._plans), len(self._groups)
+                "loaded storage: %d plans, %d batches, %d groups",
+                len(self._plans), len(self._batches), len(self._groups),
             )
 
     def flush(self) -> None:
@@ -125,6 +163,7 @@ class Storage:
             payload = {
                 "format_version": _TOP_LEVEL_VERSION,
                 "plans": [plan_to_dict(p) for p in self._plans.values()],
+                "batches": [batch_to_dict(b) for b in self._batches.values()],
                 "groups": [asdict(g) for g in self._groups.values()],
                 "health": [
                     {"group": name, **asdict(m)} for name, m in self._health.items()

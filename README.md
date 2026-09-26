@@ -50,6 +50,44 @@ RUNNING  --abort-->    ROLLING_BACK  --finish_rollback-->  ROLLED_BACK
 - 后台自动放量（`POST /plans/{id}/run`）中，门禁阻塞超过
   `step_timeout_seconds` 自动回滚，`failure_reason=gate_timeout`。
 
+## 多组协同发布（批次）
+
+一次发布可覆盖多个实例组：`POST /batches` 创建批次，每个目标组有各自
+的 `version`、`steps`（放量节奏）与可选 `gate`。批次复用与单组计划相同
+的状态机（PENDING/RUNNING/SUCCEEDED/ROLLING_BACK/ROLLED_BACK/ABORTED）。
+
+推进规则：
+
+- `POST /batches/{id}/advance` 先对**每一组**分别做健康门禁判定，
+  全部通过才推进；任一组 `WAITING`/`BLOCKED` 时整批**不产生任何状态
+  变更**——其余组不得继续各自扩量到无法回收的位置。
+- 门禁全过后，各未完成的组分别推进一步（各组步数可不同，已到 100 的
+  组保持不动），批次状态与所有组权重在**同一把锁内一次原子落盘**，
+  对外只能看到推进前或推进后的一致快照。
+- 全部组到达 100 时批次进入 `SUCCEEDED`。
+
+整批回滚规则：
+
+- `POST /batches/{id}/rollback` 把**所有组一起**恢复到各自的最近稳定
+  点；批次状态与全部组状态单次原子落盘，对外不会出现「一部分组已
+  回滚、另一部分还没回滚」的中间状态。
+- 回滚幂等且可重入：已 `ROLLED_BACK` 重复触发为 no-op；并发重复触发
+  与串行执行等价，不产生额外副作用。
+- 后台整批放量（`POST /batches/{id}/run`）中门禁阻塞超过
+  `step_timeout_seconds` 时整批自动回滚，`failure_reason=gate_timeout`。
+
+观测：`GET /batches/{id}` 返回每组的当前步、流量权重、门禁判定结论与
+依据（`gate_verdict`/`gate_basis` 为实时判定，`last_verdict`/`last_basis`
+为最近一次推进时的判定），以及整批统一结论 `conclusion`。
+
+组冲突：
+
+- 同一实例组上不允许同时存在两条进行中的发布（单组计划或批次）。
+  创建时与启动时都会检查，冲突返回 `group_conflict`（HTTP 409），
+  与参数非法（422）、状态机错误（409 illegal_transition）可区分。
+- 发布到达终态（SUCCEEDED/ROLLED_BACK/ABORTED）后，该组可被新发布
+  重新使用。
+
 ## 并发与中断恢复
 
 - 同一计划的所有变更由条纹锁串行化：N 个并发 `advance` 的结果与某种
@@ -58,15 +96,19 @@ RUNNING  --abort-->    ROLLING_BACK  --finish_rollback-->  ROLLED_BACK
   `reject`（HTTP 429）或 `queue` 处理；任务结束必定释放信号量与线程，
   不泄漏后台资源。
 - 进程重启后 `recover()`：
-  - `ROLLING_BACK`（回滚被中断）→ 重新执行到 `ROLLED_BACK`；
-  - `RUNNING` 但组状态与稳定点不一致（半更新）→ 修复回稳定点；
-  - 计划数据本身不丢失。
+  - `ROLLING_BACK`（回滚被中断）→ 重新执行到 `ROLLED_BACK`（批次则
+    整批一起完成，不留半回滚状态）；
+  - `RUNNING` 但组状态与稳定点不一致（半更新）→ 修复回稳定点（批次
+    对所有偏离组一次性原子修复）；
+  - 计划与批次数据本身不丢失。
 
 ## 持久化格式演进
 
-- 存储文件与计划均带 `format_version`（当前 v2）。
-- v1 缺少的字段（`gate`、`stable`、`failure_reason`、组权重等）加载时
-  赋予确定缺省（门禁阈值 0.05/0.2，稳定点权重 0）。
+- 存储文件顶层 `format_version` 当前为 v3（新增 `batches`），计划为
+  v2，批次为 v1；读取兼容顶层 v1/v2/v3。
+- 旧文件缺失的内容有确定缺省：v1/v2 存储没有 `batches` → 空批次集合；
+  v1 计划缺少 `gate`/`stable`/`failure_reason` → 门禁阈值 0.05/0.2、
+  稳定点权重 0。旧的单组计划加载后按原单组语义继续工作。
 - 未知或更高的版本、损坏的 JSON → `storage_corrupt`（HTTP 500），
   **明确拒绝**而不是静默按默认值继续。
 
@@ -97,9 +139,17 @@ RUNNING  --abort-->    ROLLING_BACK  --finish_rollback-->  ROLLED_BACK
 | `POST /plans/{id}/rollback` | 回滚（幂等） |
 | `POST /plans/{id}/abort` | 人工中止 |
 | `GET /plans/{id}` / `GET /plans` | 观测 |
+| `POST /batches` | 创建多组批次（targets: group/version/steps/gate） |
+| `POST /batches/{id}/start` | 启动批次 |
+| `POST /batches/{id}/advance` | 整批推进一步（全部门禁通过才原子生效） |
+| `POST /batches/{id}/run` | 后台自动整批放量，超时整批回滚 |
+| `POST /batches/{id}/rollback` | 整批回滚（幂等、原子） |
+| `POST /batches/{id}/abort` | 中止批次 |
+| `GET /batches/{id}` / `GET /batches` | 批次观测（每组进度 + 整批结论） |
 | `POST /groups/{g}/health` | 上报健康指标 |
 
-错误码：`plan_not_found` 404、`illegal_transition`/`gate_blocked` 409、
+错误码：`plan_not_found`/`batch_not_found` 404、
+`illegal_transition`/`gate_blocked`/`group_conflict` 409、
 `validation_error` 422、`concurrency_limit` 429、`storage_corrupt` 500。
 
 ## 验证方法
@@ -119,4 +169,22 @@ uv run pytest -v -s   # -s 可看到每个用例打印的输入与判定依据
 - `test_illegal_transitions_have_distinct_reasons` — 非法迁移原因可区分；
 - `test_gate_blocks_and_waits` — 门禁 WAITING/BLOCKED 不产生中间态；
 - `test_concurrency_limit_reject` — 并发上限拒绝且无资源泄漏；
-- `test_storage.py` — 原子写往返、v1 缺省、不兼容格式明确拒绝。
+- `test_storage.py` — 原子写往返、v1 缺省、不兼容格式明确拒绝；
+- `test_batch.py` — 多组协同发布：
+  - `test_batch_advance_per_group_progress_and_overall_conclusion` —
+    各组独立节奏推进与整批结论观测；
+  - `test_batch_gate_block_stops_whole_batch` — 任一组被挡下时整批
+    不产生状态变更；
+  - `test_batch_rollback_restores_all_groups_and_is_reentrant` /
+    `test_batch_rollback_atomic_snapshot_via_storage` — 整批回滚原子
+    一致、重复与并发触发无副作用；
+  - `test_group_conflict_between_plan_and_batch` — 计划/批次互相冲突
+    且原因可区分（`group_conflict`）；
+  - `test_recovery_finishes_interrupted_batch_rollback` /
+    `test_recovery_repairs_diverged_batch_group` — 批次中断恢复；
+  - `test_legacy_v2_storage_without_batches_loads` /
+    `test_legacy_v1_plan_defaults_still_apply` /
+    `test_incompatible_batch_format_rejected` — 旧数据兼容加载与
+    不兼容明确拒绝；
+- `test_api.py::test_batch_flow_via_api` /
+  `test_batch_conflict_via_api` — 批次 HTTP 端到端与冲突错误码。
