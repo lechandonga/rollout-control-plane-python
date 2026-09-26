@@ -87,6 +87,14 @@ class RolloutService:
                          else f"plan {p.plan_id}")
                 raise GroupConflictError(p.group, owner)
 
+    def _assert_not_batch_member(self, plan: RolloutPlan, action: str) -> None:
+        """批次成员计划只能经批次接口操作，保证整批语义不被单计划绕过。"""
+        if plan.batch_id is not None:
+            raise IllegalTransitionError(
+                plan.plan_id, plan.status.value, action,
+                f"plan is managed by batch {plan.batch_id}; use batch APIs",
+            )
+
     def _transition(self, plan: RolloutPlan, action: str) -> None:
         """状态机迁移校验：非法迁移抛出带区分原因的异常。"""
         key = (plan.status, action)
@@ -171,6 +179,7 @@ class RolloutService:
     def start(self, plan_id: str) -> RolloutPlan:
         with self._lock_for(plan_id):
             plan = self._must_get(plan_id)
+            self._assert_not_batch_member(plan, "start")
             self._transition(plan, "start")
             self.storage.save_plan(plan)
             return plan
@@ -179,6 +188,7 @@ class RolloutService:
         """推进一步。门禁未通过时不产生任何状态变更。"""
         with self._lock_for(plan_id):
             plan = self._must_get(plan_id)
+            self._assert_not_batch_member(plan, "advance")
             if plan.status != PlanStatus.RUNNING:
                 self._transition(plan, "advance")  # 必然抛出，给出区分原因
             verdict, basis = self._evaluate_gate(plan)
@@ -213,6 +223,7 @@ class RolloutService:
         """回滚到最近稳定点。幂等：已回滚完成的计划重复触发无副作用。"""
         with self._lock_for(plan_id):
             plan = self._must_get(plan_id)
+            self._assert_not_batch_member(plan, "rollback")
             if plan.status == PlanStatus.ROLLED_BACK:
                 log.info("plan %s already ROLLED_BACK, no-op (reentrant)", plan_id)
                 return plan
@@ -228,14 +239,14 @@ class RolloutService:
             self._finish_rollback(plan)
             return plan
 
-    def _finish_rollback(self, plan: RolloutPlan) -> None:
+    def _finish_rollback(self, plan: RolloutPlan, flush: bool = True) -> None:
         """恢复稳定点并进入 ROLLED_BACK。调用方须持有计划锁。"""
         stable_weight = plan.stable.weight
         stable_version = plan.version if plan.stable.step_index >= 0 else "previous"
-        self._apply_weight(plan, stable_weight, stable_version)
+        self._apply_weight(plan, stable_weight, stable_version, flush=flush)
         plan.step_index = plan.stable.step_index
         self._transition(plan, "finish_rollback")
-        self.storage.save_plan(plan)
+        self.storage.save_plan(plan, flush=flush)
         log.warning("plan %s rolled back to stable weight=%d reason=%s",
                     plan.plan_id, stable_weight, plan.failure_reason)
 
@@ -243,6 +254,7 @@ class RolloutService:
         """人工中止：PENDING 直接终止；RUNNING 走回滚路径回到稳定点。"""
         with self._lock_for(plan_id):
             plan = self._must_get(plan_id)
+            self._assert_not_batch_member(plan, "abort")
             if plan.status == PlanStatus.PENDING:
                 self._transition(plan, "abort")
                 self.storage.save_plan(plan)
@@ -260,6 +272,8 @@ class RolloutService:
     # ------------------------------------------------------------------
     def run_async(self, plan_id: str, step_interval: float = 0.05) -> None:
         """后台自动放量：门禁通过则逐步推进；阻塞超过超时则自动回滚。"""
+        plan = self._must_get(plan_id)
+        self._assert_not_batch_member(plan, "run")
         acquired = self._task_sem.acquire(blocking=False)
         if not acquired:
             if self.config.overflow_policy == "queue":
@@ -348,11 +362,28 @@ class RolloutService:
     def recover(self) -> None:
         """进程重启/任务中断后的恢复。
 
+        - 批次 ROLLING_BACK：整批回滚被中断，把所有成员一起续做到
+          ROLLED_BACK，不留「只回滚了一半」的对外状态；
         - ROLLING_BACK：回滚被中断，重新执行到 ROLLED_BACK；
         - RUNNING：放量被中断，对外组状态可能停在半更新，修复回最近稳定点；
         - 其余状态不变。所有修复均落盘。
         """
         self.storage.load()
+        for batch in self.storage.list_batches():
+            with self._batch_lock_for(batch.batch_id):
+                if batch.status == PlanStatus.ROLLING_BACK:
+                    log.warning(
+                        "recover: batch %s interrupted mid-rollback, finishing",
+                        batch.batch_id)
+                    members = self._batch_members(batch)
+                    for plan in members:
+                        if plan.status == PlanStatus.RUNNING:
+                            # 崩溃发生在阶段一落盘前：补齐整批标记
+                            self._transition(plan, "rollback")
+                            plan.failure_reason = batch.failure_reason
+                            self.storage.save_plan(plan, flush=False)
+                    self.storage.save_batch(batch, members)
+                    self._finish_batch_rollback(batch, members)
         for plan in self.storage.list_plans():
             with self._lock_for(plan.plan_id):
                 if plan.status == PlanStatus.ROLLING_BACK:
@@ -496,18 +527,81 @@ class RolloutService:
             self.storage.save_batch(batch)  # 唯一一次落盘，覆盖上述全部变更
             return batch
 
-    def rollback_batch(self, batch_id: str, reason: str = "manual") -> "ReleaseBatch":
-        """整批回滚：所有成员一起回到各自最近稳定点。幂等。"""
-        raise NotImplementedError
+    def rollback_batch(self, batch_id: str, reason: str = "manual") -> ReleaseBatch:
+        """整批回滚：所有成员一起回到各自最近稳定点。
 
-    def abort_batch(self, batch_id: str) -> "ReleaseBatch":
-        raise NotImplementedError
+        - 幂等：已 ROLLED_BACK 的批次重复触发为 no-op；并发触发由批次锁
+          串行化，与串行执行等价；
+        - 两阶段落盘：先把批次与全部成员置为 ROLLING_BACK（中断可恢复），
+          再统一恢复稳定点并置 ROLLED_BACK，单次原子落盘，对外（磁盘与
+          持锁的观测接口）不会看到「部分组已回滚、部分未回滚」；
+        - 已 SUCCEEDED 的成员本就停在自己的稳定点（100），保持原状。
+        """
+        with self._batch_lock_for(batch_id):
+            batch = self._must_get_batch(batch_id)
+            if batch.status == PlanStatus.ROLLED_BACK:
+                log.info("batch %s already ROLLED_BACK, no-op (reentrant)", batch_id)
+                return batch
+            if batch.status == PlanStatus.ROLLING_BACK:
+                log.info("batch %s rollback already in progress, completing it",
+                         batch_id)
+            elif batch.status == PlanStatus.RUNNING:
+                self._batch_transition(batch, "rollback")
+            else:
+                self._batch_transition(batch, "rollback")  # 必然抛出，给出区分原因
+            batch.failure_reason = reason
+            members = self._batch_members(batch)
+            # 阶段一：整批标记 ROLLING_BACK 并落盘，中断后 recover 可续做
+            for plan in members:
+                if plan.status == PlanStatus.RUNNING:
+                    self._transition(plan, "rollback")
+                    plan.failure_reason = reason
+                    self.storage.save_plan(plan, flush=False)
+            self.storage.save_batch(batch, members)
+            # 阶段二：统一恢复稳定点，单次原子落盘
+            self._finish_batch_rollback(batch, members)
+            return batch
+
+    def _finish_batch_rollback(self, batch: ReleaseBatch,
+                               members: list[RolloutPlan]) -> None:
+        """恢复所有成员稳定点并结束批次回滚。调用方须持有批次锁。"""
+        for plan in members:
+            if plan.status == PlanStatus.ROLLING_BACK:
+                self._finish_rollback(plan, flush=False)
+        if batch.status == PlanStatus.ROLLING_BACK:
+            self._batch_transition(batch, "finish_rollback")
+        self.storage.save_batch(batch, members)  # 唯一一次落盘
+        log.warning("batch %s rolled back, reason=%s",
+                    batch.batch_id, batch.failure_reason)
+
+    def abort_batch(self, batch_id: str) -> ReleaseBatch:
+        """人工中止：PENDING 整批终止；RUNNING 走整批回滚路径。"""
+        with self._batch_lock_for(batch_id):
+            batch = self._must_get_batch(batch_id)
+            if batch.status == PlanStatus.PENDING:
+                self._batch_transition(batch, "abort")
+                members = self._batch_members(batch)
+                for plan in members:
+                    self._transition(plan, "abort")
+                    self.storage.save_plan(plan, flush=False)
+                self.storage.save_batch(batch, members)
+                log.info("batch %s aborted before start", batch_id)
+                return batch
+        return self.rollback_batch(batch_id, reason="aborted")
 
     def run_batch_async(self, batch_id: str, step_interval: float = 0.05) -> None:
         raise NotImplementedError
 
     def observe_batch(self, batch_id: str) -> dict:
-        """批次观测：每个成员的步进/权重/判定依据 + 整批统一结论。"""
+        """批次观测：每个成员的步进/权重/判定依据 + 整批统一结论。
+
+        持批次锁读取：回滚/推进中途的部分状态对外不可见，观察者只能
+        看到操作前或操作完成后的完整快照。
+        """
+        with self._batch_lock_for(batch_id):
+            return self._observe_batch_locked(batch_id)
+
+    def _observe_batch_locked(self, batch_id: str) -> dict:
         batch = self._must_get_batch(batch_id)
         members = []
         non_pass: list[str] = []
