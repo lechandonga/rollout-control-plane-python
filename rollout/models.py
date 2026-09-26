@@ -98,19 +98,23 @@ class RolloutPlan:
     stable: StablePoint = field(default_factory=lambda: StablePoint(step_index=-1, weight=0))
     gate: GatePolicy = field(default_factory=GatePolicy)
     failure_reason: str | None = None
+    # 非空表示该计划由某个多组发布批次托管，只能经批次接口操作
+    batch_id: str | None = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     # 持久化格式版本，用于格式演进
-    format_version: int = 2
+    format_version: int = 3
 
     @staticmethod
-    def new(version: str, group: str, steps: list[int], gate: GatePolicy) -> "RolloutPlan":
+    def new(version: str, group: str, steps: list[int], gate: GatePolicy,
+            batch_id: str | None = None) -> "RolloutPlan":
         return RolloutPlan(
             plan_id=uuid.uuid4().hex[:12],
             version=version,
             group=group,
             steps=list(steps),
             gate=gate,
+            batch_id=batch_id,
         )
 
     @property
@@ -118,6 +122,30 @@ class RolloutPlan:
         if self.step_index < 0:
             return 0
         return self.steps[self.step_index]
+
+
+@dataclass
+class ReleaseBatch:
+    """多组协同发布批次（持久化实体）。
+
+    批次本身不持有放量状态，放量进度由各成员计划（RolloutPlan，batch_id
+    指向本批次）分别记录；批次状态机与计划状态机一致，复用 TRANSITIONS。
+    批次的推进与回滚对成员是「整批原子」的：要么全部成员一起前进一步，
+    要么全部回到各自最近稳定点。
+    """
+
+    batch_id: str
+    plan_ids: list[str]                 # 成员计划，顺序即创建时的组顺序
+    status: PlanStatus = PlanStatus.PENDING
+    failure_reason: str | None = None
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    # 批次记录自身的格式版本（批次自 v1 起步）
+    format_version: int = 1
+
+    @staticmethod
+    def new(plan_ids: list[str]) -> "ReleaseBatch":
+        return ReleaseBatch(batch_id=uuid.uuid4().hex[:12], plan_ids=list(plan_ids))
 
 
 @dataclass
@@ -132,7 +160,7 @@ class InstanceGroupState:
 
 # ---- 序列化 / 反序列化（含格式演进） ----
 
-SUPPORTED_FORMAT_VERSIONS = (1, 2)
+SUPPORTED_FORMAT_VERSIONS = (1, 2, 3)
 
 
 def plan_to_dict(plan: RolloutPlan) -> dict[str, Any]:
@@ -147,6 +175,7 @@ def plan_from_dict(data: dict[str, Any]) -> RolloutPlan:
     格式演进规则：
       - format_version 缺失视为 v1；
       - v1 缺少的字段（gate / failure_reason / stable）使用确定缺省；
+      - v2 缺少的字段（batch_id）缺省为 None（独立单组计划）；
       - 高于当前支持的版本或版本非法 -> 抛出 ValueError，明确拒绝。
     """
     fv = data.get("format_version", 1)
@@ -170,7 +199,33 @@ def plan_from_dict(data: dict[str, Any]) -> RolloutPlan:
             max_unhealthy_ratio=float(gate_data.get("max_unhealthy_ratio", 0.2)),
         ),
         failure_reason=data.get("failure_reason"),
+        batch_id=data.get("batch_id"),  # v2 及更早无此字段 -> None
         created_at=float(data.get("created_at", 0.0)),
         updated_at=float(data.get("updated_at", 0.0)),
-        format_version=2,
+        format_version=3,
+    )
+
+
+SUPPORTED_BATCH_FORMAT_VERSIONS = (1,)
+
+
+def batch_to_dict(batch: ReleaseBatch) -> dict[str, Any]:
+    d = asdict(batch)
+    d["status"] = batch.status.value
+    return d
+
+
+def batch_from_dict(data: dict[str, Any]) -> ReleaseBatch:
+    """从持久化字典恢复批次。版本不兼容 -> ValueError，明确拒绝。"""
+    fv = data.get("format_version", 1)
+    if fv not in SUPPORTED_BATCH_FORMAT_VERSIONS:
+        raise ValueError(f"unsupported batch format_version: {fv!r}")
+    return ReleaseBatch(
+        batch_id=data["batch_id"],
+        plan_ids=[str(p) for p in data["plan_ids"]],
+        status=PlanStatus(data["status"]),
+        failure_reason=data.get("failure_reason"),
+        created_at=float(data.get("created_at", 0.0)),
+        updated_at=float(data.get("updated_at", 0.0)),
+        format_version=1,
     )

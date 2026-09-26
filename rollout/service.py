@@ -349,3 +349,34 @@ class RolloutService:
                     return True
             time.sleep(0.01)
         return False
+
+    # ------------------------------------------------------------------
+    # 多组协同发布批次（骨架，逐步实现）
+    # ------------------------------------------------------------------
+    def create_batch(self, members: list[dict]) -> "ReleaseBatch":
+        """创建覆盖多个实例组的发布批次。
+
+        members: [{"group": ..., "version": ..., "steps": [...], "gate": ...}, ...]
+        """
+        raise NotImplementedError
+
+    def start_batch(self, batch_id: str) -> "ReleaseBatch":
+        raise NotImplementedError
+
+    def advance_batch(self, batch_id: str) -> "ReleaseBatch":
+        """整批推进一步：所有成员门禁通过才一起前进，否则无任何变更。"""
+        raise NotImplementedError
+
+    def rollback_batch(self, batch_id: str, reason: str = "manual") -> "ReleaseBatch":
+        """整批回滚：所有成员一起回到各自最近稳定点。幂等。"""
+        raise NotImplementedError
+
+    def abort_batch(self, batch_id: str) -> "ReleaseBatch":
+        raise NotImplementedError
+
+    def run_batch_async(self, batch_id: str, step_interval: float = 0.05) -> None:
+        raise NotImplementedError
+
+    def observe_batch(self, batch_id: str) -> dict:
+        """批次观测：每个成员的步进/权重/判定依据 + 整批统一结论。"""
+        raise NotImplementedError

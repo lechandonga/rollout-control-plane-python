@@ -44,6 +44,19 @@ class ConcurrencyLimitError(RolloutError):
     reason = "concurrency_limit"
 
 
+class GroupConflictError(RolloutError):
+    """同一实例组上已存在进行中的发布（单组计划或批次），冲突可区分。"""
+
+    reason = "group_conflict"
+
+    def __init__(self, group: str, owner: str):
+        self.group = group
+        self.owner = owner
+        super().__init__(
+            f"group {group}: conflicting in-progress release held by {owner}"
+        )
+
+
 class StorageCorruptError(RolloutError):
     """持久化数据无法兼容，明确拒绝而非静默继续。"""
 
