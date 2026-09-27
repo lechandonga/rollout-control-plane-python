@@ -307,15 +307,20 @@ class RolloutService:
     def advance_batch(self, batch_id: str) -> BatchPlan:
         """整批推进一步：先对每组做门禁判定，全部通过才原子推进。
 
-        任一组被挡下（WAITING/BLOCKED）时，整批不产生任何状态变更——
-        其余组不得继续各自扩量到无法回收的位置。
+        任一组被挡下（WAITING/BLOCKED）时，整批不产生任何权重/进度变更
+        ——其余组不得继续各自扩量到无法回收的位置；仅把本轮各组的门禁
+        判定标注（last_verdict/last_basis）原子落盘供查询。
+
+        全程只在批次的工作副本上变更：推进完成前，已发布快照（含各组
+        权重）保持为上一世代；推进完成时批次与全部组状态一次原子发布。
+        因此并发查询只能看到推进前或推进后的完整快照。
         """
         with self._lock_for(batch_id):
-            batch = self._must_get_batch(batch_id)
-            if batch.status != PlanStatus.RUNNING:
-                self._transition(batch, "advance")  # 必然抛出，给出区分原因
+            published = self._must_get_batch(batch_id)  # 已是独立副本
+            if published.status != PlanStatus.RUNNING:
+                self._transition(published, "advance")  # 必然抛出，给出区分原因
             verdicts: list[tuple[GroupTarget, GateVerdict, str]] = []
-            for t in batch.targets:
+            for t in published.targets:
                 verdict, basis = self._evaluate_group_gate(t.group, t.gate)
                 t.last_verdict, t.last_basis = verdict.value, basis
                 verdicts.append((t, verdict, basis))
@@ -323,36 +328,40 @@ class RolloutService:
                          batch_id, t.group, verdict.value, basis)
             blocked = [(t, v, b) for t, v, b in verdicts if v is not GateVerdict.PASS]
             if blocked:
+                # 只发布判定标注；权重与步进度保持上一世代不变
+                self.storage.save_batch(published)
                 t, v, b = blocked[0]
                 raise GateBlockedError(
                     f"batch {batch_id}: group {t.group} gate {v.value}: {b}"
                 )
-            # 全部门禁通过：各组分别推进一步，整批原子生效（单次落盘）
+            # 全部门禁通过：在工作副本上把各组分别推进一步，最后整批原子发布
             groups = []
-            for t in batch.targets:
+            for t in published.targets:
                 if t.done:
                     continue
                 t.step_index += 1
                 weight = t.steps[t.step_index]
                 t.stable = StablePoint(step_index=t.step_index, weight=weight)
                 groups.append(self._group_state_for(t.group, weight, t.version))
-            if all(t.done for t in batch.targets):
-                self._transition(batch, "succeed")
+            if all(t.done for t in published.targets):
+                self._transition(published, "succeed")
                 log.info("batch %s completed: all groups at weight=100", batch_id)
             else:
-                self._transition(batch, "advance")
-            self.storage.save_batch_with_groups(batch, groups)
-            return batch
+                self._transition(published, "advance")
+            self.storage.save_batch_with_groups(published, groups)
+            return self.storage.get_batch(batch_id)
 
     def rollback_batch(self, batch_id: str, reason: str = "manual") -> BatchPlan:
         """整批回滚：所有组一起恢复各自的最近稳定点。
 
-        幂等且可重入：已 ROLLED_BACK 重复触发为 no-op；并发重复触发与
-        串行执行等价。组状态与批次状态在同一把锁内一次落盘，对外不会
-        出现「部分组已回滚、部分未回滚」的中间状态。
+        幂等且可重入：已 ROLLED_BACK 重复触发为 no-op；并发重复触发由
+        批次锁串行化，与串行执行等价。回滚全程只改工作副本并分两次原子
+        发布：先落 ROLLING_BACK（崩溃后可据此恢复，各组仍是旧世代），
+        再把 ROLLED_BACK 与全部组的稳定点权重一次发布。对外不会出现
+        「部分组已回滚、部分未回滚」的中间状态。
         """
         with self._lock_for(batch_id):
-            batch = self._must_get_batch(batch_id)
+            batch = self._must_get_batch(batch_id)  # 独立工作副本
             if batch.status == PlanStatus.ROLLED_BACK:
                 log.info("batch %s already ROLLED_BACK, no-op (reentrant)", batch_id)
                 return batch
@@ -363,9 +372,9 @@ class RolloutService:
             else:
                 self._transition(batch, "rollback")  # 必然抛出，给出区分原因
             batch.failure_reason = reason
-            self.storage.save_batch(batch)  # 先落 ROLLING_BACK，中断后可恢复
+            self.storage.save_batch(batch)  # 原子发布 ROLLING_BACK，中断后可恢复
             self._finish_batch_rollback(batch)
-            return batch
+            return self.storage.get_batch(batch_id)
 
     def _finish_batch_rollback(self, batch: BatchPlan) -> None:
         """恢复各组稳定点并进入 ROLLED_BACK。调用方须持有批次锁。"""
@@ -402,12 +411,21 @@ class RolloutService:
         return self._must_get_batch(batch_id)
 
     def observe_batch(self, batch_id: str) -> dict:
-        """批次可观测性：每组当前步、权重、判定结论与依据 + 整批统一结论。"""
-        batch = self._must_get_batch(batch_id)
+        """批次可观测性：每组当前步、权重、判定结论与依据 + 整批统一结论。
+
+        批次与全部组状态取自 storage.snapshot_batch 的同代快照，因此返回
+        内的整批 status/conclusion 与各组 step_index/current_weight/
+        group_state 必定自洽——不会出现「结论说推完了、明细还有组没动」
+        或组权重跨越两个世代的半截快照。实时门禁判定在快照之后进行，
+        不改变快照内的进度与权重。
+        """
+        batch, group_states = self.storage.snapshot_batch(batch_id)
+        if batch is None:
+            raise BatchNotFoundError(f"batch {batch_id} not found")
         per_group = []
         for t in batch.targets:
             verdict, basis = self._evaluate_group_gate(t.group, t.gate)
-            group = self.storage.get_group(t.group)
+            group = group_states.get(t.group)
             per_group.append({
                 "group": t.group,
                 "version": t.version,

@@ -59,20 +59,42 @@ RUNNING  --abort-->    ROLLING_BACK  --finish_rollback-->  ROLLED_BACK
 推进规则：
 
 - `POST /batches/{id}/advance` 先对**每一组**分别做健康门禁判定，
-  全部通过才推进；任一组 `WAITING`/`BLOCKED` 时整批**不产生任何状态
-  变更**——其余组不得继续各自扩量到无法回收的位置。
+  全部通过才推进；任一组 `WAITING`/`BLOCKED` 时整批**不产生任何权重/
+  步进度变更**（仅落本轮各组的门禁判定标注供查询）——其余组不得继续
+  各自扩量到无法回收的位置。
 - 门禁全过后，各未完成的组分别推进一步（各组步数可不同，已到 100 的
-  组保持不动），批次状态与所有组权重在**同一把锁内一次原子落盘**，
-  对外只能看到推进前或推进后的一致快照。
+  组保持不动），批次状态与所有组权重作为**一次原子发布**生效。
+
+对外快照一致性保证（推进中 / 回滚中 / 恢复后）：
+
+- **不可变快照 + 原子发布**：服务内部已经发布的批次/组状态对象永不被
+  原地修改（存储层存取均做深拷贝隔离）。每次推进或回滚只在工作副本上
+  变更，再用一次原子替换把「批次 + 该批全部组权重」发布出去。
+- **推进中查询**：`GET /batches/{id}` 与发布在同一把锁上取同代快照，
+  返回只能是**推进前或推进后的完整世代**——不会出现一部分组已是新
+  权重、另一部分组还是旧权重的半截快照；整批 `status`/`conclusion`
+  必与同一份明细里的各组 `current_weight`、`group_state.weight` 对得上
+  （不会出现结论说整批已推完、明细却还有组没动的自相矛盾）。
+- **回滚中查询**：回滚分两次原子发布——先落 `ROLLING_BACK`（崩溃后可
+  据此恢复，各组仍是上一完整世代），再把 `ROLLED_BACK` 与全部组的
+  稳定点权重一次发布。回滚窗口内各组权重始终整代一致，看不到「部分组
+  已回到稳定点、部分组还停在放量后权重」；**一次回滚请求结束后再查，
+  所有组必然都已回到各自的最近稳定点**。
+- **恢复后查询**：进程中断重启后 `recover()` 对批次做整批修复——
+  `ROLLING_BACK` 被中断则整批一起完成回滚；`RUNNING` 遗留半更新则把
+  **所有组**（不只是偏离组）一次性原子拉回最近稳定点世代。恢复后
+  查询不会只剩一半组被恢复，也不会出现无法解释的中间态；持久化文件
+  本身同样是整批一致的完整快照。
 - 全部组到达 100 时批次进入 `SUCCEEDED`。
 
 整批回滚规则：
 
 - `POST /batches/{id}/rollback` 把**所有组一起**恢复到各自的最近稳定
-  点；批次状态与全部组状态单次原子落盘，对外不会出现「一部分组已
+  点；批次状态与全部组状态单次原子发布，对外不会出现「一部分组已
   回滚、另一部分还没回滚」的中间状态。
-- 回滚幂等且可重入：已 `ROLLED_BACK` 重复触发为 no-op；并发重复触发
-  与串行执行等价，不产生额外副作用。
+- 回滚幂等且可重入：已 `ROLLED_BACK` 重复触发为 no-op（不覆盖
+  `failure_reason`、不动权重）；并发重复触发由批次锁串行化，与串行
+  执行等价，不产生额外副作用，且每个调用返回时整批都已完整回滚。
 - 后台整批放量（`POST /batches/{id}/run`）中门禁阻塞超过
   `step_timeout_seconds` 时整批自动回滚，`failure_reason=gate_timeout`。
 
@@ -90,8 +112,11 @@ RUNNING  --abort-->    ROLLING_BACK  --finish_rollback-->  ROLLED_BACK
 
 ## 并发与中断恢复
 
-- 同一计划的所有变更由条纹锁串行化：N 个并发 `advance` 的结果与某种
-  串行顺序完全一致（成功数 == 实际推进步数）。
+- 同一计划/批次的所有变更由条纹锁串行化：N 个并发 `advance` 的结果与
+  某种串行顺序完全一致（成功数 == 实际推进步数）。
+- 读取侧不与写入共享可变对象：存储层所有 `get`/`save` 均深拷贝隔离，
+  `snapshot_batch` 在同一把锁内取「批次 + 全部组」的同代快照。后台
+  自动放量、回滚进行期间被反复 `GET`，每次返回都是完整自洽的世代。
 - 后台任务数受 `max_concurrent_tasks` 限制，超限按 `overflow_policy`
   `reject`（HTTP 429）或 `queue` 处理；任务结束必定释放信号量与线程，
   不泄漏后台资源。
@@ -99,8 +124,8 @@ RUNNING  --abort-->    ROLLING_BACK  --finish_rollback-->  ROLLED_BACK
   - `ROLLING_BACK`（回滚被中断）→ 重新执行到 `ROLLED_BACK`（批次则
     整批一起完成，不留半回滚状态）；
   - `RUNNING` 但组状态与稳定点不一致（半更新）→ 修复回稳定点（批次
-    对所有偏离组一次性原子修复）；
-  - 计划与批次数据本身不丢失。
+    对**所有组**一次性原子修复，不留半恢复）；
+  - 计划与批次数据本身不丢失，磁盘快照始终整批一致。
 
 ## 持久化格式演进
 
@@ -186,5 +211,29 @@ uv run pytest -v -s   # -s 可看到每个用例打印的输入与判定依据
     `test_legacy_v1_plan_defaults_still_apply` /
     `test_incompatible_batch_format_rejected` — 旧数据兼容加载与
     不兼容明确拒绝；
+- `test_batch_consistency.py` — 整批对外快照一致性（逐份校验同一份
+  返回内整批结论与各组明细/权重自洽）：
+  - `test_concurrent_reads_during_batch_advance_see_only_coherent_snapshots`
+    — 整批推进窗口内 6 线程并发查询，只可能看到推进前/推进后的完整
+    世代，无跨代混合、无结论与明细矛盾；
+  - `test_concurrent_reads_during_batch_rollback_see_only_coherent_snapshots`
+    / `test_concurrent_reads_during_normal_rollback_strictly_coherent`
+    — 回滚窗口内并发查询无半回滚，请求结束后所有组都在稳定点；
+  - `test_repeated_and_concurrent_batch_rollback_no_extra_side_effects` /
+    `test_concurrent_rollback_from_running_all_finish_at_stable` —
+    重复与并发回滚无额外副作用，每个调用返回时都已完整回滚；
+  - `test_concurrent_reads_during_background_batch_run` /
+    `test_concurrent_reads_during_background_batch_auto_rollback` —
+    后台自动整批放量 / 超时自动回滚期间并发查询；
+  - `test_repair_after_crash_is_all-or-nothing_and_snapshots_coherent` /
+    `test_recovery_finishes_interrupted_rollback_for_all_groups` /
+    `test_recovered_snapshot_matches_disk_file_exactly` —
+    中断恢复后整批完整自洽、磁盘快照同样一致；
 - `test_api.py::test_batch_flow_via_api` /
-  `test_batch_conflict_via_api` — 批次 HTTP 端到端与冲突错误码。
+  `test_batch_conflict_via_api` /
+  `test_batch_concurrent_gets_see_only_coherent_snapshots` — 批次 HTTP
+  端到端、冲突错误码与并发查询快照自洽。
+
+> 说明：上述并发一致性用例通过在每组状态构建之间注入小延迟（测试内
+> monkeypatch `_group_state_for`）放大原子发布窗口，因此能**确定性
+> 复现**旧实现的半截快照问题；在修复后的代码上连续多轮运行均通过。

@@ -108,3 +108,68 @@ def test_batch_conflict_via_api(client):
     assert r.status_code == 409 and r.json()["error"] == "group_conflict"
     log.info("verdict: conflicting batch -> %s", r.json())
     assert client.get("/batches/nope").status_code == 404
+
+
+def test_batch_concurrent_gets_see_only_coherent_snapshots(client):
+    """HTTP 层：整批推进期间并发 GET，每份响应都必须是自洽完整快照。"""
+    import threading
+    import time
+
+    import main
+
+    r = client.post("/batches", json={"targets": [
+        {"group": "g1", "version": "v2", "steps": [10, 100]},
+        {"group": "g2", "version": "v2", "steps": [10, 100]},
+        {"group": "g3", "version": "v2", "steps": [10, 100]},
+    ]})
+    batch_id = r.json()["batch_id"]
+    assert client.post(f"/batches/{batch_id}/start").status_code == 200
+    for g in ("g1", "g2", "g3"):
+        client.post(f"/groups/{g}/health", json={})
+    assert client.post(f"/batches/{batch_id}/advance").status_code == 200
+
+    # 放大逐组发布窗口
+    orig = main._service._group_state_for
+
+    def slow(group, weight, version):
+        state = orig(group, weight, version)
+        time.sleep(0.02)
+        return state
+
+    main._service._group_state_for = slow
+    errors, vectors = [], set()
+    stop = threading.Event()
+
+    def reader():
+        while not stop.is_set():
+            body = client.get(f"/batches/{batch_id}").json()
+            ws = {}
+            for g in body["groups"]:
+                w = 0 if g["group_state"] is None else g["group_state"]["weight"]
+                ws[g["group"]] = w
+                if w != g["current_weight"]:
+                    errors.append(f"{body['status']}: {g['group']} "
+                                  f"group_weight={w} != detail={g['current_weight']}")
+            if body["status"] == "SUCCEEDED" and not all(v == 100 for v in ws.values()):
+                errors.append(f"SUCCEEDED 但明细未齐: {ws}")
+            vectors.add(tuple(sorted(ws.items())))
+
+    threads = [threading.Thread(target=reader) for _ in range(4)]
+    for t in threads:
+        t.start()
+    time.sleep(0.02)
+    resp = client.post(f"/batches/{batch_id}/advance")
+    assert resp.status_code == 200
+    time.sleep(0.05)
+    stop.set()
+    for t in threads:
+        t.join()
+    main._service._group_state_for = orig
+
+    assert not errors, errors[:3]
+    assert (("g1", 10), ("g2", 10), ("g3", 10)) in vectors
+    assert (("g1", 100), ("g2", 100), ("g3", 100)) in vectors
+    for vec in vectors:
+        assert len({w for _, w in vec}) == 1, f"半截快照: {vec}"
+    log.info("verdict: HTTP concurrent reads saw only whole generations: %s",
+             sorted(vectors))

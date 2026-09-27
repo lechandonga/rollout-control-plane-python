@@ -218,6 +218,7 @@ def test_recovery_finishes_interrupted_rollback(tmp_path):
     healthy(svc, "g1")
     svc.advance(plan.plan_id)
     # 模拟回滚进行到一半崩溃：状态停在 ROLLING_BACK
+    plan = svc.get_plan(plan.plan_id)  # 重新取已发布副本再模拟崩溃
     svc._transition(plan, "rollback")
     plan.failure_reason = "crash"
     svc.storage.save_plan(plan)

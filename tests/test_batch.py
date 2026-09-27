@@ -301,6 +301,7 @@ def test_recovery_finishes_interrupted_batch_rollback(tmp_path):
     healthy(svc, "g2")
     svc.advance_batch(batch.batch_id)  # 两组 stable=10
     # 模拟回滚进行到一半崩溃：状态停在 ROLLING_BACK，组权重仍是 10
+    batch = svc.get_batch(batch.batch_id)  # 重新取已发布副本再模拟崩溃
     svc._transition(batch, "rollback")
     batch.failure_reason = "crash"
     svc.storage.save_batch(batch)
