@@ -80,6 +80,23 @@ RUNNING  --abort-->    ROLLING_BACK  --finish_rollback-->  ROLLED_BACK
 依据（`gate_verdict`/`gate_basis` 为实时判定，`last_verdict`/`last_basis`
 为最近一次推进时的判定），以及整批统一结论 `conclusion`。
 
+对外快照一致性保证（`GET /batches/{id}`，单组 `GET /plans/{id}` 同）：
+
+- 每次查询返回的都是某次变更**之前或之后的完整快照**：批次/计划的
+  所有变更（推进、回滚、恢复修复）与快照读取共用同一把计划锁，
+  读取在锁内一次性组装完毕，因此推进中反复查询绝不会看到「一部分
+  组已是新权重、另一部分组还是旧权重」的半截状态。
+- 同一份返回内部必然自洽：每组的 `group_state.weight` 与该组
+  `current_weight` 相等；整批结论 `conclusion` 与明细对得上——
+  结论说 `SUCCEEDED` 时明细里所有组必然都已 100%，`RUNNING` 时结论
+  中的完成计数等于明细中实际到达 100% 的组数。
+- 回滚中查询只会看到「全部组未回滚」或「全部组已回各自稳定点」；
+  回滚请求结束后再查，所有组必然都在各自最近稳定点。重复、并发
+  触发回滚不产生额外副作用，也不会让快照前后矛盾。
+- 中断恢复后同样成立：`recover()` 把中断的回滚整批完成、把偏离
+  稳定点的组一次性原子修复（不存在只恢复一半组），之后查询到的
+  批次状态、各组权重与整批结论自洽，无无法解释的中间态。
+
 组冲突：
 
 - 同一实例组上不允许同时存在两条进行中的发布（单组计划或批次）。
@@ -188,3 +205,16 @@ uv run pytest -v -s   # -s 可看到每个用例打印的输入与判定依据
     不兼容明确拒绝；
 - `test_api.py::test_batch_flow_via_api` /
   `test_batch_conflict_via_api` — 批次 HTTP 端到端与冲突错误码。
+- `test_snapshot_consistency.py` — 对外快照一致性：
+  - `test_observe_batch_during_async_run_is_always_consistent` — 后台
+    整批放量进行中 4 线程并发查询，每次快照都完整自洽（该用例在未
+    加锁的读取路径上可稳定复现「半截」状态）；
+  - `test_observe_batch_during_concurrent_rollback_is_consistent` —
+    整批回滚进行中并发查询，只会看到回滚前或回滚后的完整快照；
+  - `test_repeated_and_concurrent_rollback_no_extra_effects` — 8 线程
+    并发 + 重复触发回滚，幂等无副作用，快照始终一致；
+  - `test_observe_after_recovery_from_interrupted_rollback` /
+    `test_observe_after_recovery_from_partial_group_repair` — 中断
+    恢复后查询自洽，不存在只恢复一半组；
+  - `test_observe_plan_during_async_run_is_consistent` — 单组计划
+    查询路径享有同一保证。

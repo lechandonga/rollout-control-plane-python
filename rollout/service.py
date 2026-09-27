@@ -3,6 +3,8 @@
 并发模型：
 - 每个计划一把锁（条纹锁），同一计划的所有变更串行化，因此并发请求
   的结果与某种串行执行一致；
+- 观测读取（observe / observe_batch）在同一把锁内一次性组装快照，
+  对外只会看到某次变更之前或之后的完整状态，绝不泄露中间过程；
 - 后台放量任务受 max_concurrent_tasks 信号量限制，超限按 overflow_policy
   reject 或 queue；任务句柄在结束时必定释放，不泄漏后台资源。
 持久化：每次状态变更立即经 Storage 原子落盘，中断后不丢计划、不留半更新。
@@ -402,33 +404,41 @@ class RolloutService:
         return self._must_get_batch(batch_id)
 
     def observe_batch(self, batch_id: str) -> dict:
-        """批次可观测性：每组当前步、权重、判定结论与依据 + 整批统一结论。"""
-        batch = self._must_get_batch(batch_id)
-        per_group = []
-        for t in batch.targets:
-            verdict, basis = self._evaluate_group_gate(t.group, t.gate)
-            group = self.storage.get_group(t.group)
-            per_group.append({
-                "group": t.group,
-                "version": t.version,
-                "step_index": t.step_index,
-                "current_weight": t.current_weight,
-                "stable_weight": t.stable.weight,
-                "gate_verdict": verdict.value,
-                "gate_basis": basis,
-                "last_verdict": t.last_verdict,
-                "last_basis": t.last_basis,
-                "group_state": None if group is None else {
-                    "version": group.version, "weight": group.weight,
-                },
-            })
-        return {
-            "batch_id": batch.batch_id,
-            "status": batch.status.value,
-            "conclusion": self._batch_conclusion(batch),
-            "failure_reason": batch.failure_reason,
-            "groups": per_group,
-        }
+        """批次可观测性：每组当前步、权重、判定结论与依据 + 整批统一结论。
+
+        一致性保证：整份快照在批次锁内一次性组装。批次的所有变更
+        （推进/回滚/恢复）都持有同一把锁，因此任何一次查询只能看到
+        某次变更之前或之后的完整快照，不会看到「部分组已推进、部分组
+        未推进」的中间状态；整批结论与各组明细来自同一份快照，必然
+        互相对得上。
+        """
+        with self._lock_for(batch_id):
+            batch = self._must_get_batch(batch_id)
+            per_group = []
+            for t in batch.targets:
+                verdict, basis = self._evaluate_group_gate(t.group, t.gate)
+                group = self.storage.get_group(t.group)
+                per_group.append({
+                    "group": t.group,
+                    "version": t.version,
+                    "step_index": t.step_index,
+                    "current_weight": t.current_weight,
+                    "stable_weight": t.stable.weight,
+                    "gate_verdict": verdict.value,
+                    "gate_basis": basis,
+                    "last_verdict": t.last_verdict,
+                    "last_basis": t.last_basis,
+                    "group_state": None if group is None else {
+                        "version": group.version, "weight": group.weight,
+                    },
+                })
+            return {
+                "batch_id": batch.batch_id,
+                "status": batch.status.value,
+                "conclusion": self._batch_conclusion(batch),
+                "failure_reason": batch.failure_reason,
+                "groups": per_group,
+            }
 
     @staticmethod
     def _batch_conclusion(batch: BatchPlan) -> str:
@@ -566,25 +576,30 @@ class RolloutService:
         return self._must_get(plan_id)
 
     def observe(self, plan_id: str) -> dict:
-        """可观测性：当前阶段、权重与门禁判定依据。"""
-        plan = self._must_get(plan_id)
-        verdict, basis = self._evaluate_gate(plan)
-        group = self.storage.get_group(plan.group)
-        return {
-            "plan_id": plan.plan_id,
-            "status": plan.status.value,
-            "version": plan.version,
-            "group": plan.group,
-            "step_index": plan.step_index,
-            "current_weight": plan.current_weight,
-            "stable_weight": plan.stable.weight,
-            "gate_verdict": verdict.value,
-            "gate_basis": basis,
-            "failure_reason": plan.failure_reason,
-            "group_state": None if group is None else {
-                "version": group.version, "weight": group.weight,
-            },
-        }
+        """可观测性：当前阶段、权重与门禁判定依据。
+
+        与 observe_batch 相同：整份快照在计划锁内组装，对外只会看到
+        变更前或变更后的完整状态。
+        """
+        with self._lock_for(plan_id):
+            plan = self._must_get(plan_id)
+            verdict, basis = self._evaluate_gate(plan)
+            group = self.storage.get_group(plan.group)
+            return {
+                "plan_id": plan.plan_id,
+                "status": plan.status.value,
+                "version": plan.version,
+                "group": plan.group,
+                "step_index": plan.step_index,
+                "current_weight": plan.current_weight,
+                "stable_weight": plan.stable.weight,
+                "gate_verdict": verdict.value,
+                "gate_basis": basis,
+                "failure_reason": plan.failure_reason,
+                "group_state": None if group is None else {
+                    "version": group.version, "weight": group.weight,
+                },
+            }
 
     def recover(self) -> None:
         """进程重启/任务中断后的恢复。
